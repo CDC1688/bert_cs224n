@@ -12,7 +12,11 @@ from tokenizer import BertTokenizer
 from bert import BertModel
 from optimizer import AdamW
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
+#====to add lr sheduler
+import numpy as np
+from torch.optim.lr_scheduler import LambdaLR
 
 TQDM_DISABLE=False
 # fix the random seed
@@ -43,8 +47,11 @@ class BertSentimentClassifier(torch.nn.Module):
                 param.requires_grad = False
             elif config.option == 'finetune':
                 param.requires_grad = True
+        self.linear1=torch.nn.Linear(config.hidden_size, 256)
+        self.activation=torch.nn.SiLU()
+        self.dropout=torch.nn.Dropout(0.2)
+        self.linear2=torch.nn.Linear(256, 5)
 
-        self.linear=torch.nn.Linear(config.hidden_size, 5)
 
     def forward(self, input_ids, attention_mask):
         '''Takes a batch of sentences and returns logits for sentiment classes'''
@@ -55,12 +62,12 @@ class BertSentimentClassifier(torch.nn.Module):
         last_hidden_state=output["last_hidden_state"]  #[8, 41, 768]
         pooler_output=output["pooler_output"]    #[8, 768]
 
-        # if config.option == 'pretrain':
-        #     output=pooler_output
-        # elif config.option == 'finetune':
-        bert_emb= last_hidden_state[:, 0]
-        output=self.linear(bert_emb)
-        output=F.gelu(output)
+        #bert_emb= last_hidden_state[:, 0]
+        #use learned pooled layer as google instructed
+        output=self.linear1(pooler_output)
+        output=self.activation(output)  #256
+        output=self.dropout(output)
+        output=self.linear2(output)  #5
         return output
 
 
@@ -234,6 +241,62 @@ def save_model(model, optimizer, args, config, filepath):
     print(f"save the model to {filepath}")
 
 
+#===============add some lr sheduler
+def linear_schedule(y0, y1):
+    """
+    Linear Scheduler
+    """
+    return lambda t: y0 + (y1 - y0) * t
+
+
+def cosine_decay_schedule(y0, y1):
+    """
+    Cosine Decay Scheduler
+    """
+    return lambda t: y1 + 0.5 * (y0 - y1) * (np.cos(t * np.pi) + 1.0)
+
+
+def linearized_cosine_decay_schedule(y0, y1, linearize_ratio=0):
+    """
+    Linearized Cosine Decay Scheduler
+    """
+    if linearize_ratio==0:
+        return lambda t: y1 + (y0 - y1) * 0.5 * (np.cos(t * np.pi) + 1.0)
+    else:
+        return lambda t: y1 + (y0 - y1) * ((1 - t) * linearize_ratio + 0.5 * (np.cos(t * np.pi) + 1.0) * (1 - linearize_ratio))
+
+
+def linearized_cosine_exp_decay_schedule(y0, y1, linearize_ratio=0, exp_ratio=0):
+    """
+    Linearized Cosine Decay Scheduler
+    """
+    return lambda t: y1 + (y0 - y1) * ((1 - t) * linearize_ratio + 0.5 * (np.cos(t * np.pi) + 1.0) * (1 - linearize_ratio - exp_ratio) +  pow(y1, t) * exp_ratio) 
+
+def piecewise_schedule(knots, funcs):
+    """
+    Piecewise Scheduler
+    """
+    def f(t):
+        i = np.searchsorted(knots, t)
+        t0 = 0.0 if i == 0 else knots[i - 1]
+        t1 = 1.0 if i == len(knots) else knots[i]
+        return funcs[i]((t - t0) / (t1 - t0))
+    return f
+
+
+def func_scheduler(optimizer, func, total_steps, warmup_steps=None, warmup_ratio=0.1, start_step=0):
+    """
+    Learning Rate Scheduler
+    """
+    if warmup_steps:
+        y0 = func(0.0)
+        func = piecewise_schedule(
+            [warmup_steps / total_steps],
+            [linear_schedule(warmup_ratio * y0, y0), func]
+        )
+    return LambdaLR(optimizer, (lambda step: func((step + start_step) / total_steps)))
+
+
 def train(args):
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
     # Load data
@@ -260,9 +323,19 @@ def train(args):
 
     model = BertSentimentClassifier(config)
     model = model.to(device)
+    
+    #add tensorbaord
+    tensorboard_path = args.run_path  
+    writer = SummaryWriter(log_dir=f"./runs/{tensorboard_path}")
 
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
+    
+    #====add learning rate shceduler
+    lr_scheduler = func_scheduler(
+        optimizer, linearized_cosine_exp_decay_schedule(1.0, 0.01, linearize_ratio=0.25, exp_ratio=0.55), args.epochs * len(train_dataloader),
+        warmup_steps=50, start_step=0)
+
     best_dev_acc = 0
 
     # Run for the specified number of epochs
@@ -285,6 +358,9 @@ def train(args):
             loss.backward()
             optimizer.step()
 
+            #add learing rate scheduler
+            lr_scheduler.step()
+
             train_loss += loss.item()
             num_batches += 1
 
@@ -292,6 +368,13 @@ def train(args):
 
         train_acc, train_f1, *_  = model_eval(train_dataloader, model, device)
         dev_acc, dev_f1, *_ = model_eval(dev_dataloader, model, device)
+
+        #====add
+        writer.add_scalar("loss/train", train_loss, epoch)
+        writer.add_scalar("acc/train",train_acc, epoch)
+        writer.add_scalar("f1/train",train_f1, epoch)
+        writer.add_scalar("acc/dev",dev_acc, epoch)
+        writer.add_scalar("f1/dev",dev_f1, epoch)
 
         if dev_acc > best_dev_acc:
             best_dev_acc = dev_acc
@@ -342,7 +425,7 @@ def get_args():
     parser.add_argument("--use_gpu", action='store_true')
     parser.add_argument("--dev_out", type=str, default="cfimdb-dev-output.txt")
     parser.add_argument("--test_out", type=str, default="cfimdb-test-output.txt")
-                                    
+    parser.add_argument("--run_path", type=str, default="bert_run")                                
 
     parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
     parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
@@ -370,7 +453,8 @@ if __name__ == "__main__":
         test='data/ids-sst-test-student.csv',
         option=args.option,
         dev_out = 'predictions/'+args.option+'-sst-dev-out.csv',
-        test_out = 'predictions/'+args.option+'-sst-test-out.csv'
+        test_out = 'predictions/'+args.option+'-sst-test-out.csv',
+        run_path=args.run_path
     )
 
     train(config)
@@ -384,14 +468,16 @@ if __name__ == "__main__":
         lr=args.lr,
         use_gpu=args.use_gpu,
         epochs=args.epochs,
-        batch_size=8,
+        #batch_size=8,
+        batch_size=32,
         hidden_dropout_prob=args.hidden_dropout_prob,
         train='data/ids-cfimdb-train.csv',
         dev='data/ids-cfimdb-dev.csv',
         test='data/ids-cfimdb-test-student.csv',
         option=args.option,
         dev_out = 'predictions/'+args.option+'-cfimdb-dev-out.csv',
-        test_out = 'predictions/'+args.option+'-cfimdb-test-out.csv'
+        test_out = 'predictions/'+args.option+'-cfimdb-test-out.csv',
+        run_path=args.run_path
     )
 
     train(config)
